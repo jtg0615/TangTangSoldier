@@ -67,6 +67,32 @@ const weapons = {
     emoji: '🔪',
     damage: 22,
     desc: '주변을 공전하며 적을 타격'
+  },
+  lightning: {
+    id: 'lightning',
+    name: '⚡ 번개',
+    type: 'instant',
+    baseCooldown: 2.0,
+    baseDamage: 32,
+    desc: '화면 안의 랜덤한 적에게 벼락을 내리꽂아 즉시 피해'
+  },
+  laser: {
+    id: 'laser',
+    name: '🔦 레이저',
+    type: 'beam',
+    baseCooldown: 3.0,
+    baseDamage: 40,
+    desc: '가장 가까운 적 방향으로 모든 적을 관통하는 레이저 발사'
+  },
+  flamethrower: {
+    id: 'flamethrower',
+    name: '🔥 화염방사기',
+    type: 'cone',
+    baseCooldown: 2.0,
+    baseDuration: 1.5,
+    baseRange: 140,
+    baseDamage: 12,
+    desc: '가장 가까운 적 방향으로 화염을 방사하여 지속 피해'
   }
 };
 
@@ -147,11 +173,13 @@ function getAvailableEnemyTypes(time) {
   return available;
 }
 
+const BOSS_SCALE = 2;
+
 const FONT_GROUPS = {
   small: '28px serif',
   medium: '32px serif',
   large: '48px serif',
-  boss: '56px serif'
+  boss: `${56 * BOSS_SCALE}px serif`
 };
 
 const bossEmojis = ['👹', '💀', '🐉'];
@@ -181,7 +209,7 @@ function spawnBoss() {
   enemies.push({
     type: 'boss',
     emoji: emoji,
-    radius: 36,
+    radius: 36 * BOSS_SCALE,
     speed: 95,
     damage: 35,
     fontGroup: 'boss',
@@ -247,6 +275,8 @@ const bullets = [];
 const gems = [];
 const particles = [];
 const damageNumbers = [];
+const lightningEffects = [];
+const laserEffects = [];
 
 let hitVignetteTimer = 0;
 let playerAnimTimer = 0;
@@ -288,7 +318,7 @@ function initAudio() {
 }
 
 function playTone(freqStart, freqEnd, duration, type = 'sine', gainVal = 0.1) {
-  if (!soundEnabled) return;
+  if (!soundEnabled || isPaused) return;
   try {
     initAudio();
     const osc = audioCtx.createOscillator();
@@ -360,7 +390,42 @@ function spawnDamageNumber(x, y, damage) {
   });
 }
 
-let weaponTimers = { gun: 0, shotgun: 0 };
+function createLightningBolt(startX, startY, endX, endY) {
+  const points = [{ x: startX, y: startY }];
+  const steps = 7;
+  const dx = (endX - startX) / steps;
+  const dy = (endY - startY) / steps;
+  for (let i = 1; i < steps; i++) {
+    const rx = (Math.random() - 0.5) * 36;
+    points.push({
+      x: startX + dx * i + rx,
+      y: startY + dy * i
+    });
+  }
+  points.push({ x: endX, y: endY });
+  return points;
+}
+
+function distToSegment(px, py, x1, y1, x2, y2) {
+  const l2 = (x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1);
+  if (l2 === 0) return Math.hypot(px - x1, py - y1);
+  let t = ((px - x1) * (x2 - x1) + (py - y1) * (y2 - y1)) / l2;
+  t = Math.max(0, Math.min(1, t));
+  const projX = x1 + t * (x2 - x1);
+  const projY = y1 + t * (y2 - y1);
+  return Math.hypot(px - projX, py - projY);
+}
+
+function normalizeAngle(a) {
+  while (a > Math.PI) a -= Math.PI * 2;
+  while (a < -Math.PI) a += Math.PI * 2;
+  return a;
+}
+
+const flameParticles = [];
+let flameState = { active: false, timer: 0, tickTimer: 0, angle: 0 };
+
+let weaponTimers = { gun: 0, shotgun: 0, lightning: 0, laser: 0 };
 let bladeAngle = 0;
 
 
@@ -369,6 +434,7 @@ let killCount = 0;
 let isSelectingCharacter = true;
 let isGameOver = false;
 let isLevelUp = false;
+let isPaused = false;
 let upgradeChoices = [];
 let shake = 0;
 
@@ -381,7 +447,8 @@ function selectCharacter(charId) {
   player.hp = c.maxHp;
   player.speed = c.speed;
   player.weapons = { [c.defaultWeapon]: 1 };
-  weaponTimers = { gun: 0, shotgun: 0 };
+  weaponTimers = { gun: 0, shotgun: 0, lightning: 0, laser: 0 };
+  flameState = { active: false, timer: 0, tickTimer: 0, angle: 0 };
   bladeAngle = 0;
   isSelectingCharacter = false;
 }
@@ -402,7 +469,10 @@ function getNearestEnemy() {
 function triggerLevelUp() {
   isLevelUp = true;
   playLevelUpSound();
-  const pool = [
+
+  if (!player.passives) player.passives = {};
+
+  const basePassives = [
     { id: 'dmg', title: '공격력 +20%', desc: '모든 무기 데미지가 20% 증가합니다.', apply: () => { player.damageMultiplier += 0.2; } },
     { id: 'aspd', title: '공격속도 +15%', desc: '무기 공격 주기가 15% 빨라집니다.', apply: () => { player.attackSpeedMultiplier += 0.15; } },
     { id: 'spd', title: '이동속도 +10%', desc: '이동 속도가 10% 증가합니다.', apply: () => { player.speed *= 1.1; } },
@@ -411,20 +481,37 @@ function triggerLevelUp() {
     { id: 'range', title: '경험치 획득 범위 +30%', desc: '보석 자석 흡수 범위가 증가합니다.', apply: () => { player.pickupRadius *= 1.3; } }
   ];
 
+  const otherCards = [];
+  for (const p of basePassives) {
+    const curLevel = player.passives[p.id] || 0;
+    if (curLevel < 5) {
+      otherCards.push({
+        id: `p_${p.id}`,
+        title: p.title,
+        desc: p.desc,
+        apply: () => {
+          player.passives[p.id] = (player.passives[p.id] || 0) + 1;
+          p.apply();
+        }
+      });
+    }
+  }
+
   const currentWeaponKeys = Object.keys(player.weapons);
   const canAcquireNew = currentWeaponKeys.length < 4;
+  const upgradeCards = [];
 
   for (const [wId, w] of Object.entries(weapons)) {
     const curLevel = player.weapons[wId] || 0;
     if (curLevel > 0 && curLevel < 5) {
-      pool.push({
+      upgradeCards.push({
         id: `w_up_${wId}`,
         title: `${w.name} Lv.${curLevel + 1}`,
         desc: `${w.name}의 성능과 데미지가 강화됩니다.`,
         apply: () => { player.weapons[wId] += 1; }
       });
     } else if (curLevel === 0 && canAcquireNew) {
-      pool.push({
+      otherCards.push({
         id: `w_new_${wId}`,
         title: `신규 무기: ${w.name}`,
         desc: w.desc,
@@ -433,8 +520,22 @@ function triggerLevelUp() {
     }
   }
 
-  const shuffled = pool.sort(() => 0.5 - Math.random());
-  upgradeChoices = shuffled.slice(0, 3);
+  const shuffle = (arr) => arr.sort(() => 0.5 - Math.random());
+  shuffle(upgradeCards);
+  shuffle(otherCards);
+
+  upgradeChoices = [];
+
+  // 1. 이미 보유한 무기/스킬의 강화 카드가 1개 이상 있으면 최소 1장 확정 포함
+  if (upgradeCards.length > 0) {
+    upgradeChoices.push(upgradeCards.pop());
+  }
+
+  // 2. 남은 풀에서 3장이 채워질 때까지 무작위 선택
+  const remainingPool = shuffle([...upgradeCards, ...otherCards]);
+  while (upgradeChoices.length < 3 && remainingPool.length > 0) {
+    upgradeChoices.push(remainingPool.pop());
+  }
 }
 
 function gainExp(amount) {
@@ -488,13 +589,20 @@ function resetGame() {
   player.damageMultiplier = 1;
   player.attackSpeedMultiplier = 1;
   player.extraProjectiles = 0;
+  player.passives = {};
 
   enemies.length = 0;
   bullets.length = 0;
   gems.length = 0;
   particles.length = 0;
   damageNumbers.length = 0;
+  lightningEffects.length = 0;
+  laserEffects.length = 0;
+  flameParticles.length = 0;
   hitVignetteTimer = 0;
+
+  weaponTimers = { gun: 0, shotgun: 0, lightning: 0, laser: 0 };
+  flameState = { active: false, timer: 0, tickTimer: 0, angle: 0 };
 
   spawnTimer = 0;
   killCount = 0;
@@ -505,6 +613,7 @@ function resetGame() {
   isSelectingCharacter = true;
   isGameOver = false;
   isLevelUp = false;
+  isPaused = false;
   upgradeChoices = [];
 }
 
@@ -571,6 +680,16 @@ window.addEventListener('click', (e) => {
 });
 
 window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    if (e.repeat) return;
+    if (!isGameOver && !isLevelUp && !isSelectingCharacter) {
+      isPaused = !isPaused;
+      if (!isPaused) {
+        lastTime = performance.now();
+      }
+    }
+    return;
+  }
   keys[e.key.toLowerCase()] = true;
   if (isGameOver && e.key.toLowerCase() === 'r') resetGame();
 });
@@ -584,7 +703,7 @@ function gameLoop(time) {
   lastTime = time;
 
   // 이동 입력 및 대각선 속도 보정
-  if (!isGameOver && !isLevelUp && !isSelectingCharacter) {
+  if (!isGameOver && !isLevelUp && !isSelectingCharacter && !isPaused) {
     elapsedTime += dt;
 
     let dx = 0;
@@ -742,6 +861,184 @@ function gameLoop(time) {
       }
     }
 
+    // Weapon 4: Lightning (⚡ 번개)
+    if (player.weapons.lightning) {
+      weaponTimers.lightning += dt;
+      const lvl = player.weapons.lightning;
+      const cooldown = (weapons.lightning.baseCooldown * Math.pow(0.9, lvl - 1)) / player.attackSpeedMultiplier;
+      if (weaponTimers.lightning >= cooldown) {
+        weaponTimers.lightning = 0;
+
+        const onScreenEnemies = [];
+        for (let i = 0; i < enemies.length; i++) {
+          const e = enemies[i];
+          const sx = e.x - player.x + canvas.width / 2;
+          const sy = e.y - player.y + canvas.height / 2;
+          if (sx >= -20 && sx <= canvas.width + 20 && sy >= -20 && sy <= canvas.height + 20) {
+            onScreenEnemies.push(e);
+          }
+        }
+
+        if (onScreenEnemies.length > 0) {
+          const targetCount = Math.min(lvl, onScreenEnemies.length);
+          const shuffled = onScreenEnemies.sort(() => 0.5 - Math.random());
+          const targets = shuffled.slice(0, targetCount);
+          const dmg = (weapons.lightning.baseDamage * (1 + (lvl - 1) * 0.2)) * player.damageMultiplier;
+
+          shake = Math.max(shake, 2);
+          playTone(650, 140, 0.12, 'sawtooth', 0.08);
+
+          for (const target of targets) {
+            const startX = target.x + (Math.random() * 40 - 20);
+            const startY = target.y - (canvas.height / 2 + 80);
+            lightningEffects.push({
+              points: createLightningBolt(startX, startY, target.x, target.y),
+              life: 0.15,
+              maxLife: 0.15
+            });
+
+            target.hp -= dmg;
+            target.hitFlashTimer = 0.1;
+            spawnDamageNumber(target.x, target.y, dmg);
+            spawnDeathParticles(target.x, target.y, '#f1c40f');
+
+            if (target.hp <= 0) {
+              const ei = enemies.indexOf(target);
+              if (ei !== -1) {
+                killEnemy(target, ei);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Weapon 5: Laser (🔦 레이저)
+    if (player.weapons.laser) {
+      weaponTimers.laser += dt;
+      const lvl = player.weapons.laser;
+      const cooldown = weapons.laser.baseCooldown / player.attackSpeedMultiplier;
+      if (weaponTimers.laser >= cooldown) {
+        weaponTimers.laser = 0;
+        const nearest = getNearestEnemy();
+        if (nearest) {
+          const baseAngle = Math.atan2(nearest.y - player.y, nearest.x - player.x);
+          const beamCount = lvl >= 5 ? 2 : 1;
+          const beamThickness = 10 + (lvl - 1) * 2;
+          const dmg = (weapons.laser.baseDamage * (1 + (lvl - 1) * 0.25)) * player.damageMultiplier;
+          const beamLength = Math.hypot(canvas.width, canvas.height) + 200;
+
+          playTone(400, 800, 0.15, 'sine', 0.1);
+          shake = Math.max(shake, 1.5);
+
+          for (let bi = 0; bi < beamCount; bi++) {
+            const angle = baseAngle + bi * Math.PI;
+            const x1 = player.x;
+            const y1 = player.y;
+            const x2 = player.x + Math.cos(angle) * beamLength;
+            const y2 = player.y + Math.sin(angle) * beamLength;
+
+            laserEffects.push({
+              x1, y1, x2, y2,
+              thickness: beamThickness,
+              life: 0.2,
+              maxLife: 0.2
+            });
+
+            for (let ei = enemies.length - 1; ei >= 0; ei--) {
+              const enemy = enemies[ei];
+              const dist = distToSegment(enemy.x, enemy.y, x1, y1, x2, y2);
+              if (dist <= enemy.radius + beamThickness / 2) {
+                enemy.hp -= dmg;
+                enemy.hitFlashTimer = 0.1;
+                spawnDamageNumber(enemy.x, enemy.y, dmg);
+                spawnDeathParticles(enemy.x, enemy.y, '#00d2d3');
+                if (enemy.hp <= 0) {
+                  killEnemy(enemy, ei);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Weapon 6: Flamethrower (🔥 화염방사기)
+    if (player.weapons.flamethrower) {
+      const lvl = player.weapons.flamethrower;
+      const duration = weapons.flamethrower.baseDuration + (lvl - 1) * 0.2;
+      const restTime = weapons.flamethrower.baseCooldown / player.attackSpeedMultiplier;
+      const range = weapons.flamethrower.baseRange * (1 + (lvl - 1) * 0.1);
+      const dmg = (weapons.flamethrower.baseDamage * (1 + (lvl - 1) * 0.2)) * player.damageMultiplier;
+      const halfAngle = 30 * (Math.PI / 180);
+
+      flameState.timer += dt;
+
+      if (flameState.active) {
+        const nearest = getNearestEnemy();
+        if (nearest) {
+          flameState.angle = Math.atan2(nearest.y - player.y, nearest.x - player.x);
+        } else {
+          flameState.angle = player.facing === 1 ? 0 : Math.PI;
+        }
+
+        flameState.tickTimer += dt;
+        if (flameState.tickTimer >= 0.2) {
+          flameState.tickTimer -= 0.2;
+
+          for (let ei = enemies.length - 1; ei >= 0; ei--) {
+            const enemy = enemies[ei];
+            const dist = Math.hypot(enemy.x - player.x, enemy.y - player.y);
+            if (dist <= range + enemy.radius) {
+              const enemyAngle = Math.atan2(enemy.y - player.y, enemy.x - player.x);
+              const angleDiff = Math.abs(normalizeAngle(enemyAngle - flameState.angle));
+              if (angleDiff <= halfAngle) {
+                enemy.hp -= dmg;
+                enemy.hitFlashTimer = 0.1;
+                spawnDamageNumber(enemy.x, enemy.y, dmg);
+                if (enemy.hp <= 0) {
+                  killEnemy(enemy, ei);
+                }
+              }
+            }
+          }
+        }
+
+        if (flameParticles.length < 90) {
+          const spawnCount = 2 + Math.floor(Math.random() * 2);
+          for (let pi = 0; pi < spawnCount; pi++) {
+            const spreadAngle = flameState.angle + (Math.random() - 0.5) * (halfAngle * 1.6);
+            const speed = (range / 0.45) * (0.65 + Math.random() * 0.45);
+            const colors = ['#ff4757', '#ff6348', '#ffa502', '#ff7f50', '#eccc68'];
+            const color = colors[Math.floor(Math.random() * colors.length)];
+            const life = 0.3 + Math.random() * 0.15;
+            flameParticles.push({
+              x: player.x + Math.cos(spreadAngle) * 15,
+              y: player.y + Math.sin(spreadAngle) * 15,
+              vx: Math.cos(spreadAngle) * speed,
+              vy: Math.sin(spreadAngle) * speed,
+              radius: 3 + Math.random() * 3.5,
+              color: color,
+              life: life,
+              maxLife: life
+            });
+          }
+        }
+
+        if (flameState.timer >= duration) {
+          flameState.active = false;
+          flameState.timer = 0;
+        }
+      } else {
+        if (flameState.timer >= restTime) {
+          flameState.active = true;
+          flameState.timer = 0;
+          flameState.tickTimer = 0.2;
+          playTone(220, 90, 0.2, 'sawtooth', 0.05);
+        }
+      }
+    }
+
     // Update bullets
     for (let bi = bullets.length - 1; bi >= 0; bi--) {
       const b = bullets[bi];
@@ -850,6 +1147,15 @@ function gameLoop(time) {
       if (p.life <= 0) particles.splice(pi, 1);
     }
 
+    // Update flame particles
+    for (let fpi = flameParticles.length - 1; fpi >= 0; fpi--) {
+      const fp = flameParticles[fpi];
+      fp.x += fp.vx * dt;
+      fp.y += fp.vy * dt;
+      fp.life -= dt;
+      if (fp.life <= 0) flameParticles.splice(fpi, 1);
+    }
+
     // Update damage numbers
     for (let di = damageNumbers.length - 1; di >= 0; di--) {
       const d = damageNumbers[di];
@@ -857,14 +1163,28 @@ function gameLoop(time) {
       d.life -= dt;
       if (d.life <= 0) damageNumbers.splice(di, 1);
     }
+
+    // Update lightning effects
+    for (let li = lightningEffects.length - 1; li >= 0; li--) {
+      const le = lightningEffects[li];
+      le.life -= dt;
+      if (le.life <= 0) lightningEffects.splice(li, 1);
+    }
+
+    // Update laser effects
+    for (let li = laserEffects.length - 1; li >= 0; li--) {
+      const le = laserEffects[li];
+      le.life -= dt;
+      if (le.life <= 0) laserEffects.splice(li, 1);
+    }
   }
 
-  if (hitVignetteTimer > 0) {
+  if (hitVignetteTimer > 0 && !isPaused) {
     hitVignetteTimer -= dt;
   }
 
   // Shake 감쇠 (일시정지 중 멈춤)
-  if (!isLevelUp && !isSelectingCharacter) {
+  if (!isLevelUp && !isSelectingCharacter && !isPaused) {
     shake *= 0.9;
     if (shake < 0.5) shake = 0;
   }
@@ -929,10 +1249,10 @@ function gameLoop(time) {
 
       // Boss Overhead HP Bar & Level
       if (enemy.isBoss) {
-        const bBarW = 70;
-        const bBarH = 7;
+        const bBarW = Math.round(enemy.radius * 2.2);
+        const bBarH = 8;
         const bBarX = sx - bBarW / 2;
-        const bBarY = sy - enemy.radius - 20;
+        const bBarY = sy - enemy.radius - (enemy.radius * 0.35 + 8);
 
         ctx.fillStyle = '#ff4757';
         ctx.font = 'bold 12px sans-serif';
@@ -1025,6 +1345,20 @@ function gameLoop(time) {
     ctx.restore();
   }
 
+  // Flame Particles (Orange/Red circles)
+  for (const fp of flameParticles) {
+    const sx = fp.x - player.x + canvas.width / 2;
+    const sy = fp.y - player.y + canvas.height / 2;
+    const alpha = Math.max(0, fp.life / fp.maxLife);
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = fp.color;
+    ctx.beginPath();
+    ctx.arc(sx, sy, Math.max(1, fp.radius * (0.6 + 0.6 * (1 - alpha))), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
   // Floating Damage Numbers
   ctx.font = 'bold 15px sans-serif';
   ctx.textAlign = 'center';
@@ -1036,6 +1370,78 @@ function gameLoop(time) {
     ctx.globalAlpha = Math.max(0, d.life / d.maxLife);
     ctx.fillStyle = '#fffa65';
     ctx.fillText(d.text, sx, sy);
+    ctx.restore();
+  }
+
+  // Lightning Effects (Yellow Zig-Zag lines)
+  for (const le of lightningEffects) {
+    if (le.points.length < 2) continue;
+    const alpha = Math.max(0, le.life / le.maxLife);
+    ctx.save();
+    ctx.globalAlpha = alpha;
+
+    // 외곽 노란색 빛
+    ctx.strokeStyle = '#f1c40f';
+    ctx.lineWidth = 3.5;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    const p0 = le.points[0];
+    ctx.moveTo(p0.x - player.x + canvas.width / 2, p0.y - player.y + canvas.height / 2);
+    for (let i = 1; i < le.points.length; i++) {
+      const pt = le.points[i];
+      ctx.lineTo(pt.x - player.x + canvas.width / 2, pt.y - player.y + canvas.height / 2);
+    }
+    ctx.stroke();
+
+    // 중심 흰색 광선
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(p0.x - player.x + canvas.width / 2, p0.y - player.y + canvas.height / 2);
+    for (let i = 1; i < le.points.length; i++) {
+      const pt = le.points[i];
+      ctx.lineTo(pt.x - player.x + canvas.width / 2, pt.y - player.y + canvas.height / 2);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // Laser Effects (Cyan Double-layer Glow Beam, no shadowBlur)
+  for (const le of laserEffects) {
+    const alpha = Math.max(0, le.life / le.maxLife);
+    const sx1 = le.x1 - player.x + canvas.width / 2;
+    const sy1 = le.y1 - player.y + canvas.height / 2;
+    const sx2 = le.x2 - player.x + canvas.width / 2;
+    const sy2 = le.y2 - player.y + canvas.height / 2;
+
+    ctx.save();
+    ctx.lineCap = 'round';
+
+    // 1층: 외곽 하늘색 넓은 글로우
+    ctx.strokeStyle = `rgba(72, 219, 251, ${alpha * 0.45})`;
+    ctx.lineWidth = le.thickness * 2.2;
+    ctx.beginPath();
+    ctx.moveTo(sx1, sy1);
+    ctx.lineTo(sx2, sy2);
+    ctx.stroke();
+
+    // 2층: 선명한 하늘색 메인 빔
+    ctx.strokeStyle = `rgba(10, 189, 227, ${alpha * 0.85})`;
+    ctx.lineWidth = le.thickness;
+    ctx.beginPath();
+    ctx.moveTo(sx1, sy1);
+    ctx.lineTo(sx2, sy2);
+    ctx.stroke();
+
+    // 코어: 중심 백색 코어
+    ctx.strokeStyle = `rgba(255, 255, 255, ${alpha})`;
+    ctx.lineWidth = Math.max(2, le.thickness * 0.35);
+    ctx.beginPath();
+    ctx.moveTo(sx1, sy1);
+    ctx.lineTo(sx2, sy2);
+    ctx.stroke();
+
     ctx.restore();
   }
 
@@ -1284,6 +1690,22 @@ function gameLoop(time) {
     ctx.fillStyle = '#bdc3c7';
     ctx.font = '16px sans-serif';
     ctx.fillText("Press 'R' to Restart", canvas.width / 2, canvas.height / 2 + 130);
+  }
+
+  // PAUSED Overlay
+  if (isPaused) {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 44px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('PAUSED', canvas.width / 2, canvas.height / 2 - 20);
+
+    ctx.fillStyle = '#bdc3c7';
+    ctx.font = '18px sans-serif';
+    ctx.fillText('ESC를 눌러 계속', canvas.width / 2, canvas.height / 2 + 30);
   }
 
   requestAnimationFrame(gameLoop);
